@@ -79,6 +79,8 @@
 
   .ledger-row{display:flex;align-items:center;gap:8px;padding:13px 0;border-bottom:1px dashed var(--line)}
   .ledger-row:last-child{border-bottom:none}
+  .date-group-header{font-size:11.5px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;padding:14px 2px 6px}
+  .date-group-header:first-child{padding-top:6px}
   .lr-dot{width:7px;height:7px;border-radius:50%;flex:0 0 auto}
   .lr-main{flex:1 1 auto;min-width:0}
   .lr-label{font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -173,6 +175,7 @@ let currentView = 'dashboard';
 let loansTab = 'lent';
 let openSchedules = {};
 let txFilter = 'all';
+let txPeriod = 'all';
 
 const ICONS = {
   dashboard: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="8" height="8" rx="1.5"/><rect x="13" y="3" width="8" height="5" rx="1.5"/><rect x="13" y="12" width="8" height="9" rx="1.5"/><rect x="3" y="14" width="8" height="7" rx="1.5"/></svg>',
@@ -203,6 +206,51 @@ function fmtDateShort(iso){
   return d.toLocaleDateString('en-IN', { day:'numeric', month:'short' });
 }
 function daysBetween(a,b){ return Math.round((new Date(b) - new Date(a)) / 86400000); }
+function fmtTime(hhmm){
+  if(!hhmm) return '';
+  const [h,m] = hhmm.split(':').map(Number);
+  const period = h>=12 ? 'PM' : 'AM';
+  const h12 = h%12===0 ? 12 : h%12;
+  return `${h12}:${String(m).padStart(2,'0')} ${period}`;
+}
+function nowTimeHHMM(){
+  const d = new Date();
+  return String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+}
+function periodRange(period){
+  const today = new Date(todayISO()+'T00:00:00');
+  if(period==='today') return { start: todayISO(), end: todayISO() };
+  if(period==='week'){
+    const day = today.getDay();
+    const diffToMonday = (day===0 ? 6 : day-1);
+    const monday = new Date(today); monday.setDate(today.getDate()-diffToMonday);
+    const sunday = new Date(monday); sunday.setDate(monday.getDate()+6);
+    return { start: monday.toISOString().slice(0,10), end: sunday.toISOString().slice(0,10) };
+  }
+  if(period==='month'){
+    const start = new Date(today.getFullYear(), today.getMonth(), 1);
+    const end = new Date(today.getFullYear(), today.getMonth()+1, 0);
+    return { start: start.toISOString().slice(0,10), end: end.toISOString().slice(0,10) };
+  }
+  return null;
+}
+function inPeriod(dateStr, period){
+  const range = periodRange(period);
+  if(!range) return true;
+  return dateStr >= range.start && dateStr <= range.end;
+}
+function groupByDate(list){
+  const groups = [];
+  let last = null;
+  list.forEach(item => {
+    if(!last || last.date !== item.date){
+      last = { date: item.date, items: [] };
+      groups.push(last);
+    }
+    last.items.push(item);
+  });
+  return groups;
+}
 function addMonths(iso, n){
   const d = new Date(iso + 'T00:00:00');
   d.setMonth(d.getMonth() + n);
@@ -432,6 +480,7 @@ function renderDashboard(){
   const due = combinedDue(5);
   const recent = [...state.transactions].sort((a,b)=>b.date.localeCompare(a.date)).slice(0,5);
   const iouReminders = allIouOutstanding();
+  const bhBal = bhandaraBalance();
   return `
     <div class="page-head"><p>Here's where things stand today, ${fmtDate(todayISO())}.</p></div>
     <div class="cards">
@@ -440,6 +489,7 @@ function renderDashboard(){
       <div class="card"><div class="card-label">Balance</div><div class="card-value num" style="color:${t.balance>=0?'var(--income)':'var(--expense)'}">${fmtMoney(t.balance)}</div></div>
       <div class="card"><div class="card-label">Owed to you</div><div class="card-value num loan-text">${fmtMoney(t.outstanding)}</div></div>
       <div class="card" style="grid-column:1 / -1"><div class="card-label">You still owe (loans taken)</div><div class="card-value num expense-text">${fmtMoney(t.owedOutstanding)}</div></div>
+      <div class="card" style="grid-column:1 / -1;cursor:pointer" onclick="setView('bhandara')"><div class="card-label">Bhandara — cash available</div><div class="card-value num" style="color:${bhBal>=0?'var(--income)':'var(--expense)'}">${fmtMoney(bhBal)}</div></div>
     </div>
 
     <section class="block">
@@ -526,7 +576,23 @@ function txRow(tx){
       <span class="lr-dot" style="background:${isIncome?'var(--income)':'var(--expense)'}"></span>
       <div class="lr-main">
         <div class="lr-label">${escapeHtml(tx.category)}</div>
-        <div class="lr-sub">${fmtDateShort(tx.date)}${tx.note ? ' · ' + escapeHtml(tx.note) : ''}</div>
+        <div class="lr-sub">${fmtDateShort(tx.date)}${tx.time ? ', ' + fmtTime(tx.time) : ''}${tx.note ? ' · ' + escapeHtml(tx.note) : ''}</div>
+      </div>
+      <div style="text-align:right">
+        <div class="lr-amount num" style="color:${isIncome?'var(--income)':'var(--expense)'}">${isIncome?'+':'-'}${fmtMoney(tx.amount)}</div>
+        <button class="icon-btn" title="Delete" onclick="deleteTransaction('${tx.id}')">${ICONS.trash}</button>
+      </div>
+    </div>`;
+}
+
+function txRowTimeOnly(tx){
+  const isIncome = tx.type==='income';
+  return `
+    <div class="ledger-row">
+      <span class="lr-dot" style="background:${isIncome?'var(--income)':'var(--expense)'}"></span>
+      <div class="lr-main">
+        <div class="lr-label">${escapeHtml(tx.category)}</div>
+        <div class="lr-sub">${tx.time ? fmtTime(tx.time) : '—'}${tx.note ? ' · ' + escapeHtml(tx.note) : ''}</div>
       </div>
       <div style="text-align:right">
         <div class="lr-amount num" style="color:${isIncome?'var(--income)':'var(--expense)'}">${isIncome?'+':'-'}${fmtMoney(tx.amount)}</div>
@@ -538,7 +604,10 @@ function txRow(tx){
 function renderTransactions(){
   const list = state.transactions
     .filter(t => txFilter==='all' ? true : t.type===txFilter)
-    .sort((a,b)=>b.date.localeCompare(a.date));
+    .filter(t => inPeriod(t.date, txPeriod))
+    .sort((a,b)=> (b.date+(b.time||'00:00')).localeCompare(a.date+(a.time||'00:00')));
+  const groups = groupByDate(list);
+  const periodLabel = { all:'All time', today:'Today', week:'This week', month:'This month' };
   return `
     <div class="page-head"><p>Every rupee in, every rupee out.</p></div>
     <div class="tabs">
@@ -546,25 +615,55 @@ function renderTransactions(){
       <button class="tab ${txFilter==='income'?'active':''}" onclick="setTxFilter('income')">Income</button>
       <button class="tab ${txFilter==='expense'?'active':''}" onclick="setTxFilter('expense')">Expense</button>
     </div>
+    <div class="tabs">
+      <button class="tab ${txPeriod==='all'?'active':''}" onclick="setTxPeriod('all')">All time</button>
+      <button class="tab ${txPeriod==='today'?'active':''}" onclick="setTxPeriod('today')">Daily</button>
+      <button class="tab ${txPeriod==='week'?'active':''}" onclick="setTxPeriod('week')">Weekly</button>
+      <button class="tab ${txPeriod==='month'?'active':''}" onclick="setTxPeriod('month')">Monthly</button>
+    </div>
     <div class="panel">
-      ${list.length ? list.map(tx => txRow(tx)).join('') : `<div class="empty">Nothing here yet. Tap + to add your first entry.</div>`}
+      ${groups.length ? groups.map(g => `
+        <div class="date-group-header">${fmtDate(g.date)}</div>
+        ${g.items.map(tx => txRowTimeOnly(tx)).join('')}
+      `).join('') : `<div class="empty">Nothing here for ${periodLabel[txPeriod].toLowerCase()}. Tap + to add an entry.</div>`}
     </div>
   `;
 }
 function setTxFilter(f){ txFilter = f; render(); }
+function setTxPeriod(p){ txPeriod = p; render(); }
 
 function bhandaraBalance(){
   return state.bhandara.ledger.reduce((s,e) => s + (e.type==='in' ? Number(e.amount) : -Number(e.amount)), 0);
 }
 let bhFilter = 'all';
+let bhPeriod = 'all';
 function setBhFilter(f){ bhFilter = f; render(); }
+function setBhPeriod(p){ bhPeriod = p; render(); }
+function bhandaraRowTimeOnly(e){
+  const isIn = e.type==='in';
+  return `
+    <div class="ledger-row">
+      <span class="lr-dot" style="background:${isIn?'var(--income)':'var(--expense)'}"></span>
+      <div class="lr-main">
+        <div class="lr-label">${escapeHtml(e.category || (isIn ? 'Added to Bhandara' : 'Taken from Bhandara'))}</div>
+        <div class="lr-sub">${e.time ? fmtTime(e.time) : '—'}${e.note ? ' · ' + escapeHtml(e.note) : ''}</div>
+      </div>
+      <div style="text-align:right">
+        <div class="lr-amount num" style="color:${isIn?'var(--income)':'var(--expense)'}">${isIn?'+':'-'}${fmtMoney(e.amount)}</div>
+        <button class="icon-btn" title="Delete" onclick="deleteBhandaraEntry('${e.id}')">${ICONS.trash}</button>
+      </div>
+    </div>`;
+}
 function renderBhandara(){
   const bal = bhandaraBalance();
   const inTotal = state.bhandara.ledger.filter(e=>e.type==='in').reduce((s,e)=>s+Number(e.amount),0);
   const outTotal = state.bhandara.ledger.filter(e=>e.type==='out').reduce((s,e)=>s+Number(e.amount),0);
   const list = state.bhandara.ledger
     .filter(e => bhFilter==='all' ? true : e.type===bhFilter)
-    .sort((a,b)=>b.date.localeCompare(a.date));
+    .filter(e => inPeriod(e.date, bhPeriod))
+    .sort((a,b)=> (b.date+(b.time||'00:00')).localeCompare(a.date+(a.time||'00:00')));
+  const groups = groupByDate(list);
+  const periodLabel = { all:'All time', today:'Today', week:'This week', month:'This month' };
   return `
     <div class="page-head"><p>Your home cash box — what's in it, and where it's gone.</p></div>
     <div class="cards">
@@ -577,8 +676,17 @@ function renderBhandara(){
       <button class="tab ${bhFilter==='in'?'active':''}" onclick="setBhFilter('in')">Added</button>
       <button class="tab ${bhFilter==='out'?'active':''}" onclick="setBhFilter('out')">Spent / taken</button>
     </div>
+    <div class="tabs">
+      <button class="tab ${bhPeriod==='all'?'active':''}" onclick="setBhPeriod('all')">All time</button>
+      <button class="tab ${bhPeriod==='today'?'active':''}" onclick="setBhPeriod('today')">Daily</button>
+      <button class="tab ${bhPeriod==='week'?'active':''}" onclick="setBhPeriod('week')">Weekly</button>
+      <button class="tab ${bhPeriod==='month'?'active':''}" onclick="setBhPeriod('month')">Monthly</button>
+    </div>
     <div class="panel">
-      ${list.length ? list.map(e => bhandaraRow(e)).join('') : `<div class="empty">No entries yet. Tap + to add cash in or log a spend.</div>`}
+      ${groups.length ? groups.map(g => `
+        <div class="date-group-header">${fmtDate(g.date)}</div>
+        ${g.items.map(e => bhandaraRowTimeOnly(e)).join('')}
+      `).join('') : `<div class="empty">Nothing here for ${periodLabel[bhPeriod].toLowerCase()}. Tap + to add cash in or log a spend.</div>`}
     </div>
   `;
 }
@@ -589,7 +697,7 @@ function bhandaraRow(e){
       <span class="lr-dot" style="background:${isIn?'var(--income)':'var(--expense)'}"></span>
       <div class="lr-main">
         <div class="lr-label">${escapeHtml(e.category || (isIn ? 'Added to Bhandara' : 'Taken from Bhandara'))}</div>
-        <div class="lr-sub">${fmtDateShort(e.date)}${e.note ? ' · ' + escapeHtml(e.note) : ''}</div>
+        <div class="lr-sub">${fmtDateShort(e.date)}${e.time ? ', ' + fmtTime(e.time) : ''}${e.note ? ' · ' + escapeHtml(e.note) : ''}</div>
       </div>
       <div style="text-align:right">
         <div class="lr-amount num" style="color:${isIn?'var(--income)':'var(--expense)'}">${isIn?'+':'-'}${fmtMoney(e.amount)}</div>
@@ -667,7 +775,7 @@ function submitBhandara(e){
   const date = document.getElementById('bhDate').value || todayISO();
   const note = document.getElementById('bhNote').value.trim();
   if(!amount || amount<=0) return;
-  state.bhandara.ledger.push({ id: uid(), type: bhType, amount, category, date, note });
+  state.bhandara.ledger.push({ id: uid(), type: bhType, amount, category, date, note, time: nowTimeHHMM() });
   saveState();
   closeModal();
   render();
@@ -1000,7 +1108,7 @@ function submitTransaction(e){
   const date = document.getElementById('txDate').value || todayISO();
   const note = document.getElementById('txNote').value.trim();
   if(!amount || amount<=0) return;
-  state.transactions.push({ id: uid(), type: newTxType, amount, category, date, note });
+  state.transactions.push({ id: uid(), type: newTxType, amount, category, date, note, time: nowTimeHHMM() });
   saveState();
   closeModal();
   render();
